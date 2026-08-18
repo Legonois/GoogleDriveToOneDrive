@@ -12,7 +12,7 @@ import sys
 from tqdm import tqdm
 
 from config import CHECKPOINT_EVERY, GDRIVE_ROOT, ONEDRIVE_DEST
-from backup import backup_one, iter_files
+from backup import backup_one, iter_files, prepare_staging
 from logger import iso_now, log
 from manifest import load_manifest, save_manifest, write_summary
 
@@ -27,6 +27,8 @@ def main() -> int:
         log(f"Source not found: {GDRIVE_ROOT}")
         return 1
     ONEDRIVE_DEST.mkdir(parents=True, exist_ok=True)
+
+    prepare_staging(ONEDRIVE_DEST)
 
     manifest = load_manifest(ONEDRIVE_DEST)
     log(f"Starting backup: {GDRIVE_ROOT} -> {ONEDRIVE_DEST}")

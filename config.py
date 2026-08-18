@@ -25,6 +25,19 @@ COPY_CHUNK_SIZE = 1024 * 1024   # 1 MiB
 COPY_RETRIES    = 3             # attempts per file before giving up
 COPY_RETRY_WAIT = 5.0           # seconds to wait between attempts
 
+# ---- Staging ---------------------------------------------------------------
+# Copy G: -> a plain local folder first, then rename that file into the
+# OneDrive destination. The rename is metadata-only when staging and
+# destination share a volume, so Drive FS reads and OneDrive writes never
+# happen inside the same I/O operation -- which is what starves the kernel's
+# paged pool and produces WinError 1450.
+#
+# STAGING_DIR must be on the SAME DRIVE as ONEDRIVE_DEST (normally C:) and
+# must NOT be inside a OneDrive-synced folder. None -> a "gd2od-staging"
+# folder under the system temp dir, which satisfies both on a stock setup.
+USE_STAGING = True
+STAGING_DIR = None
+
 # ---- Manifest / summary filenames -----------------------------------------
 MANIFEST_NAME = ".backup_manifest.json"
 SUMMARY_NAME  = "LAST_BACKUP.txt"

@@ -1,6 +1,7 @@
 """Per-file backup logic + directory walker."""
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from config import (
     PUBLISHER_EXTS,
     SKIP_EXTS,
     SOURCE_IS_GOOGLE_DRIVE,
+    STAGING_DIR,
+    USE_STAGING,
 )
 from cloud_files import dehydrate, is_placeholder, pin, wait_until_hydrated
 from logger import iso_now, log
@@ -19,6 +22,8 @@ from manifest import source_fingerprint
 # ERROR_NO_SYSTEM_RESOURCES / ERROR_WORKING_SET_QUOTA -- transient kernel
 # resource exhaustion from stacked filter drivers (Drive FS + OneDrive).
 TRANSIENT_WINERRORS = {1450, 1453}
+
+STAGE_PREFIX = "gd2od-"
 
 
 def is_publisher_file(path: Path) -> bool:
@@ -38,39 +43,93 @@ def dehydrate_source(path: Path) -> None:
     dehydrate_if_needed(path)
 
 
-def _copy_chunked(src: Path, dst: Path) -> None:
-    """
-    Stream src -> dst through a bounded buffer, writing to a .part temp file
-    and renaming on success.
+def staging_dir() -> Path:
+    """The folder we copy into before renaming across to OneDrive."""
+    base = Path(STAGING_DIR) if STAGING_DIR else Path(tempfile.gettempdir()) / "gd2od-staging"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
-    Deliberately avoids shutil.copy2, which on Windows dispatches to the Win32
-    CopyFile2 API. CopyFile2 fails with WinError 1450 when the read side is
-    Google Drive's virtual drive and the write side is a OneDrive-synced
-    folder; a plain read/write loop pulls the stream at a pace Drive FS can
-    actually serve.
-    """
+
+def prepare_staging(dest_root: Path) -> None:
+    """Warn if staging won't buy us anything, and clear leftovers from a crash."""
+    if not USE_STAGING:
+        return
+    stage = staging_dir()
+
+    if stage.drive.lower() != dest_root.drive.lower():
+        log(f"WARNING: staging dir {stage} is on a different drive than "
+            f"{dest_root}; the hand-off will be a full copy, not a rename. "
+            f"Set STAGING_DIR in config.py to a folder on {dest_root.drive}")
+
+    stale = list(stage.glob(STAGE_PREFIX + "*"))
+    for leftover in stale:
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
+    if stale:
+        log(f"Cleared {len(stale)} leftover staged file(s) from {stage}")
+
+
+def _stream(src: Path, dst: Path) -> None:
+    """Copy src -> dst through a bounded buffer. dst must not already exist."""
+    with open(src, "rb", buffering=0) as fsrc, open(dst, "wb", buffering=0) as fdst:
+        while True:
+            chunk = fsrc.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            fdst.write(chunk)
+        fdst.flush()
+        os.fsync(fdst.fileno())
+
+
+def _copy_direct(src: Path, dst: Path) -> None:
+    """Stream straight into the destination folder via a .part temp file."""
     tmp = dst.with_name(dst.name + ".part")
     try:
-        with open(src, "rb", buffering=0) as fsrc, open(tmp, "wb", buffering=0) as fdst:
-            while True:
-                chunk = fsrc.read(COPY_CHUNK_SIZE)
-                if not chunk:
-                    break
-                fdst.write(chunk)
-            fdst.flush()
-            os.fsync(fdst.fileno())
+        _stream(src, tmp)
+        shutil.copystat(src, tmp)
         os.replace(tmp, dst)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    shutil.copystat(src, dst)
+
+
+def _copy_staged(src: Path, dst: Path) -> None:
+    """
+    Two hops: G: -> local staging file, then staging file -> destination.
+
+    The second hop is os.replace, which is a metadata-only rename when both
+    sides share a volume. So Drive FS never reads while OneDrive writes, and
+    the staged file is already complete and closed before OneDrive sees it.
+    """
+    fd, tmp_name = tempfile.mkstemp(prefix=STAGE_PREFIX, dir=staging_dir())
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        _stream(src, tmp)
+        shutil.copystat(src, tmp)
+        try:
+            os.replace(tmp, dst)
+        except OSError as e:
+            # Cross-volume rename (ERROR_NOT_SAME_DEVICE / EXDEV). Fall back to
+            # a second stream; still worth it, since the read side is now local
+            # disk rather than Drive FS.
+            if getattr(e, "winerror", None) != 17 and e.errno != 18:
+                raise
+            _copy_direct(tmp, dst)
+            tmp.unlink(missing_ok=True)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def copy_with_retry(src: Path, dst: Path) -> None:
     """Chunked copy, retrying transient filter-driver resource errors."""
+    copier = _copy_staged if USE_STAGING else _copy_direct
     for attempt in range(1, COPY_RETRIES + 1):
         try:
-            _copy_chunked(src, dst)
+            copier(src, dst)
             return
         except OSError as e:
             transient = getattr(e, "winerror", None) in TRANSIENT_WINERRORS
@@ -79,15 +138,6 @@ def copy_with_retry(src: Path, dst: Path) -> None:
             log(f"RETRY {attempt}/{COPY_RETRIES - 1} after WinError "
                 f"{e.winerror} on {src}")
             time.sleep(COPY_RETRY_WAIT * attempt)
-
-
-def iter_files(root: Path):
-    """Yield every real file under `root`, skipping Google-native shortcuts."""
-    for dirpath, _, filenames in os.walk(root):
-        for name in filenames:
-            if Path(name).suffix.lower() in SKIP_EXTS:
-                continue
-            yield Path(dirpath) / name
 
 
 def backup_one(src: Path, dst: Path, manifest: dict, rel_key: str) -> str:
