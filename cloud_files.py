@@ -3,6 +3,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import cancel
 from config import HYDRATE_TIMEOUT, POLL_INTERVAL
 from logger import log
 
@@ -53,11 +54,12 @@ def wait_until_hydrated(path: Path) -> bool:
     deadline = time.time() + HYDRATE_TIMEOUT
     expected = path.stat().st_size
     while time.time() < deadline:
+        cancel.check()
         if not is_placeholder(path):
             s1 = path.stat().st_size
-            time.sleep(0.5)
+            cancel.sleep(0.5)
             s2 = path.stat().st_size
             if s1 == s2 == expected:
                 return True
-        time.sleep(POLL_INTERVAL)
+        cancel.sleep(POLL_INTERVAL)
     return False

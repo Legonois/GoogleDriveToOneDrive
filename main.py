@@ -11,6 +11,7 @@ import sys
 
 from tqdm import tqdm
 
+import cancel
 from config import CHECKPOINT_EVERY, GDRIVE_ROOT, ONEDRIVE_DEST
 from backup import backup_one, iter_files, prepare_staging
 from logger import iso_now, log
@@ -23,6 +24,8 @@ def count_files(root) -> int:
 
 
 def main() -> int:
+    cancel.install()
+
     if not GDRIVE_ROOT.exists():
         log(f"Source not found: {GDRIVE_ROOT}")
         return 1
@@ -51,6 +54,7 @@ def main() -> int:
 
     try:
         for src in iter_files(GDRIVE_ROOT):
+            cancel.check()
             rel = src.relative_to(GDRIVE_ROOT)
             dst = ONEDRIVE_DEST / rel
             rel_key = str(rel).replace("\\", "/")

@@ -2,7 +2,6 @@
 import os
 import shutil
 import tempfile
-import time
 from pathlib import Path
 
 from config import (
@@ -15,6 +14,7 @@ from config import (
     STAGING_DIR,
     USE_STAGING,
 )
+import cancel
 from cloud_files import dehydrate, is_placeholder, pin, wait_until_hydrated
 from logger import iso_now, log
 from manifest import source_fingerprint
@@ -28,6 +28,15 @@ STAGE_PREFIX = "gd2od-"
 
 def is_publisher_file(path: Path) -> bool:
     return path.suffix.lower() in PUBLISHER_EXTS
+
+
+def iter_files(root: Path):
+    """Yield every real file under `root`, skipping Google-native shortcuts."""
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if Path(name).suffix.lower() in SKIP_EXTS:
+                continue
+            yield Path(dirpath) / name
 
 
 def dehydrate_if_needed(path: Path) -> None:
@@ -75,6 +84,10 @@ def _stream(src: Path, dst: Path) -> None:
     """Copy src -> dst through a bounded buffer. dst must not already exist."""
     with open(src, "rb", buffering=0) as fsrc, open(dst, "wb", buffering=0) as fdst:
         while True:
+            # Safe point: a pending Ctrl-C stops us here rather than after the
+            # whole file. This is as responsive as it gets -- the read below is
+            # not interruptible once it blocks.
+            cancel.check()
             chunk = fsrc.read(COPY_CHUNK_SIZE)
             if not chunk:
                 break
@@ -137,7 +150,8 @@ def copy_with_retry(src: Path, dst: Path) -> None:
                 raise
             log(f"RETRY {attempt}/{COPY_RETRIES - 1} after WinError "
                 f"{e.winerror} on {src}")
-            time.sleep(COPY_RETRY_WAIT * attempt)
+            cancel.sleep(COPY_RETRY_WAIT * attempt)
+            cancel.check()
 
 
 def backup_one(src: Path, dst: Path, manifest: dict, rel_key: str) -> str:
